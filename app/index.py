@@ -52,9 +52,10 @@ class State:
     n: int  # 总篇数 N(空文档计入)
     avgdl: float  # 平均文档长度(空文档按 0 计入)
     terms: dict  # 词项 -> TermData
+    version: int = 0  # 成功更正次数;同一 State 内的语料与版本号必然一致
 
 
-def build_state(docs: dict) -> State:
+def build_state(docs: dict, version: int = 0) -> State:
     """由 {编号: (正文, 分词序列)} 构建完整状态。空文档计入 N 与平均长度。"""
     ids = tuple(sorted(docs.keys()))
     n = len(ids)
@@ -95,7 +96,9 @@ def build_state(docs: dict) -> State:
             docids=docids, contribs=contribs, block_last=block_last, suffix_max=suffix_max
         )
 
-    return State(docs=docs, ids=ids, texts=texts, n=n, avgdl=avgdl, terms=terms)
+    return State(
+        docs=docs, ids=ids, texts=texts, n=n, avgdl=avgdl, terms=terms, version=version
+    )
 
 
 class _Cursor:
@@ -256,11 +259,11 @@ class IndexManager:
                 docs[did] = (text, tuple(tokens))
             if len(docs) > MAX_DOCS:
                 raise CapacityError(f"更正后总篇数 {len(docs)} 超过上限 {MAX_DOCS},本批未生效")
-            new_state = self._build(docs)
+            new_state = self._build(docs, self._state.version + 1)
             self._state = new_state  # 原子切换:之后的新查询使用新状态
             return new_state, deleted
 
-    def _build(self, docs: dict) -> State:
+    def _build(self, docs: dict, version: int) -> State:
         if self._build_delay > 0:
             time.sleep(self._build_delay)  # 慢建索引:占写锁但不挡读者
-        return build_state(docs)
+        return build_state(docs, version=version)

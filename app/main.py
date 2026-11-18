@@ -1,11 +1,12 @@
 """FastAPI 入口:设备维修记录 BM25 精确检索。
 
-- POST /documents/batch  批量增改删(语料、全库统计、剪枝依据一起生效)
-- POST /search           正式检索(BlockMax WAND 块上界剪枝)
-- POST /search/exhaustive 对照接口(全量计分后排序,仅用于验证一致性)
-- GET  /stats            当前状态统计
-- GET  /healthz          健康检查
-- GET  /docs             Swagger UI
+- POST /documents/batch      批量增改删(语料、全库统计、剪枝依据一起生效)
+- POST /search               正式检索(BlockMax WAND 块上界剪枝)
+- POST /search/exhaustive    对照接口(全量计分后排序,仅用于验证一致性)
+- POST /pairing/evaluate     两种维修措施 A/B 的配对评估
+- GET  /stats                当前状态统计
+- GET  /healthz              健康检查
+- GET  /docs                 Swagger UI
 """
 from __future__ import annotations
 
@@ -15,7 +16,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
 from .index import B, K1, MAX_DOCS, CapacityError, IndexManager, exhaustive_search, search
-from .schemas import BatchRequest, BatchResponse, Hit, SearchRequest, SearchResponse
+from .pairing import GroupItem, PairingInputError, evaluate as evaluate_pairing, validate_groups
+from .schemas import (
+    BatchRequest,
+    BatchResponse,
+    Hit,
+    OutcomeDetail,
+    PairDetail,
+    PairingRequest,
+    PairingResponse,
+    SearchRequest,
+    SearchResponse,
+)
 
 
 def create_app(manager: IndexManager | None = None) -> FastAPI:
@@ -48,6 +60,7 @@ def create_app(manager: IndexManager | None = None) -> FastAPI:
             "docs": s.n,
             "avg_len": s.avgdl,
             "terms": len(s.terms),
+            "version": s.version,
             "k1": K1,
             "b": B,
             "max_docs": MAX_DOCS,
@@ -81,6 +94,90 @@ def create_app(manager: IndexManager | None = None) -> FastAPI:
         hits, scored = exhaustive_search(state, req.terms, req.k)
         return SearchResponse(
             hits=[Hit(id=i, text=t, score=sc) for i, t, sc in hits], scored=scored
+        )
+
+    @app.post("/pairing/evaluate", response_model=PairingResponse, tags=["pairing"])
+    def pairing_evaluate_ep(req: PairingRequest):
+        """A/B 两组维修措施的配对评估。
+
+        规则:去重分词集合的 Jaccard 相似度 >= 0.5 才允许跨组配对,每单至多用一次;
+        先使配对数最多,再使相似度之和最大。在全部最优配对中给出恢复率之差的
+        最小值和最大值及各自明细(最优唯一时两者相同);无配对时报证据不足。
+        编号缺失或重复时整次拒绝(422)。
+        校验、配对与统计都在同一个 State 快照上完成,对应同一版记录。
+        """
+        state = manager.current()  # 一次性取快照:校验与评估共用同一版本
+        a_items = [GroupItem(r.id, r.recovered) for r in req.a]
+        b_items = [GroupItem(r.id, r.recovered) for r in req.b]
+        try:
+            validate_groups(state, a_items, b_items)
+        except PairingInputError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "请求被整体拒绝,未做任何评估",
+                    "missing_ids": exc.missing,
+                    "duplicate_ids": exc.duplicates,
+                },
+            ) from exc
+
+        ev = evaluate_pairing(state, a_items, b_items)
+
+        def outcome_detail(outcome) -> OutcomeDetail:
+            return OutcomeDetail(
+                difference=outcome.difference,
+                difference_float=float(outcome.difference),
+                a_recovery_rate=outcome.a_rate,
+                b_recovery_rate=outcome.b_rate,
+                a_recovered=outcome.a_recovered,
+                b_recovered=outcome.b_recovered,
+                pairs=[
+                    PairDetail(
+                        a_id=p.a_id,
+                        b_id=p.b_id,
+                        similarity=p.similarity,
+                        similarity_float=float(p.similarity),
+                    )
+                    for p in outcome.pairs
+                ],
+            )
+
+        if ev.paired == 0:
+            return PairingResponse(
+                version=ev.version,
+                paired=0,
+                similarity_sum=ev.similarity_sum,
+                optimal_pairing_count=ev.optimal_pairing_count,
+                insufficient_evidence=True,
+                unique_optimal_pairing=False,
+                min_difference=None,
+                max_difference=None,
+                message="证据不足:没有相似度达到 0.5 的跨组可配对记录",
+            )
+
+        min_detail = outcome_detail(ev.min_outcome)
+        max_detail = outcome_detail(ev.max_outcome)
+        if ev.unique_optimal_pairing:
+            message = (
+                f"最优配对唯一:共 {ev.paired} 对,A、B 恢复率之差为 "
+                f"{ev.min_outcome.difference}"
+            )
+        else:
+            message = (
+                f"最优配对不唯一(共 {ev.optimal_pairing_count} 种):恢复率之差"
+                f"最小 {ev.min_outcome.difference}、最大 {ev.max_outcome.difference},"
+                "须同时参考两者的配对明细"
+            )
+        return PairingResponse(
+            version=ev.version,
+            paired=ev.paired,
+            similarity_sum=ev.similarity_sum,
+            optimal_pairing_count=ev.optimal_pairing_count,
+            insufficient_evidence=False,
+            unique_optimal_pairing=ev.unique_optimal_pairing,
+            min_difference=min_detail,
+            max_difference=max_detail,
+            message=message,
         )
 
     return app
